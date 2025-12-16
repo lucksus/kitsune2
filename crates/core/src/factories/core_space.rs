@@ -286,16 +286,17 @@ impl TxSpaceHandler for TxHandlerTranslator {
                 is_blocked
             },
             None => {
-                // DEBUG: This defaults to blocked! Could be due to network issues
+                // DEBUG: Changed from defaulting to BLOCKED to ALLOWED
+                // This prevents network issues from causing false blocks
                 tracing::warn!(
                     peer_url = ?peer_url,
-                    msg = "⚠️ NO ACCESS DECISION - DEFAULTING TO BLOCKED (likely network/peer-store issue!)",
+                    msg = "⚠️ NO ACCESS DECISION - ALLOWING (changed from blocking to handle network issues)",
                 );
                 tracing::debug!(
-                    "No access decision found for peer url: {:?}",
+                    "No access decision found for peer url: {:?}, allowing access",
                     peer_url
                 );
-                true
+                false  // Changed from true to false - allow instead of block
             }
         };
         Ok(blocked)
