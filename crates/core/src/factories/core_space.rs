@@ -273,11 +273,24 @@ impl TxSpaceHandler for TxHandlerTranslator {
             .peer_access_state
             .get_access_decision(peer_url.clone())?
         {
-            Some(access) => access.decision == AccessDecision::Blocked,
+            Some(access) => {
+                let is_blocked = access.decision == AccessDecision::Blocked;
+                if is_blocked {
+                    tracing::warn!(
+                        peer_url = ?peer_url,
+                        decision = ?access.decision,
+                        decided_at = ?access.decided_at,
+                        msg = "🚫 Peer has explicit BLOCKED access decision",
+                    );
+                }
+                is_blocked
+            },
             None => {
-                // This is normal for blocked peers, but could be a bug for others. Best to log at
-                // debug level which can be accessed if needed but won't create noisy logs if a
-                // blocked peer keeps sending messages.
+                // DEBUG: This defaults to blocked! Could be due to network issues
+                tracing::warn!(
+                    peer_url = ?peer_url,
+                    msg = "⚠️ NO ACCESS DECISION - DEFAULTING TO BLOCKED (likely network/peer-store issue!)",
+                );
                 tracing::debug!(
                     "No access decision found for peer url: {:?}",
                     peer_url

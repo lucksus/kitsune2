@@ -75,6 +75,11 @@ impl CorePeerAccessState {
                     };
 
                     if agents_by_url.is_empty() {
+                        // DEBUG: This is a key event - no agents means next check will block!
+                        tracing::warn!(
+                            peer_url = ?peer_url,
+                            msg = "⚠️ NO AGENTS AT URL - removing access decision (will default to blocked next check!)",
+                        );
                         tracing::debug!("No agents found for url, clearing decision because they will be treated as blocked anyway: {:?}", peer_url);
 
                         // Any existing decision can be removed
@@ -96,11 +101,19 @@ impl CorePeerAccessState {
                         };
 
                         let access = if all_blocked {
+                            tracing::error!(
+                                peer_url = ?peer_url,
+                                msg = "🚫 ALL AGENTS AT URL ARE BLOCKED - setting Blocked decision",
+                            );
                             PeerAccess {
                                 decision: AccessDecision::Blocked,
                                 decided_at: Timestamp::now(),
                             }
                         } else {
+                            tracing::debug!(
+                                peer_url = ?peer_url,
+                                msg = "✅ Granting access to peer URL",
+                            );
                             PeerAccess {
                                 decision: AccessDecision::Granted,
                                 decided_at: Timestamp::now(),
