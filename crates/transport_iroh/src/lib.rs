@@ -26,7 +26,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 use tokio::task::AbortHandle;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 mod frame;
 use frame::*;
@@ -114,22 +114,34 @@ impl IrohTransportFactory {
 
 impl TransportFactory for IrohTransportFactory {
     fn default_config(&self, config: &mut Config) -> K2Result<()> {
+        trace!("IrohTransportFactory::default_config called");
         config.set_module_config(&IrohTransportModConfig::default())
     }
 
     fn validate_config(&self, config: &Config) -> K2Result<()> {
+        trace!("IrohTransportFactory::validate_config called");
         let config: IrohTransportModConfig = config.get_module_config()?;
+        debug!(
+            relay_url = ?config.iroh_transport.relay_url,
+            relay_allow_plain_text = config.iroh_transport.relay_allow_plain_text,
+            max_frame_bytes = config.iroh_transport.max_frame_bytes,
+            connect_timeout_s = config.iroh_transport.connect_timeout_s,
+            "validating iroh transport config"
+        );
 
         if let Some(relay) = &config.iroh_transport.relay_url {
             let relay_server_url = ::url::Url::parse(relay)
                 .map_err(|err| K2Error::other_src("invalid relay URL", err))?;
+            debug!(scheme = ?relay_server_url.scheme(), "parsed relay URL");
             if relay_server_url.scheme() == "http"
                 && !config.iroh_transport.relay_allow_plain_text
             {
+                error!("plaintext relay URL not allowed");
                 return Err(K2Error::other("disallowed plaintext relay url"));
             }
         }
 
+        info!("iroh transport config validation passed");
         Ok(())
     }
 
@@ -138,13 +150,21 @@ impl TransportFactory for IrohTransportFactory {
         builder: Arc<Builder>,
         handler: DynTxHandler,
     ) -> BoxFut<'static, K2Result<DynTransport>> {
+        info!("IrohTransportFactory::create called - starting transport creation");
         Box::pin(async move {
             let handler = TxImpHnd::new(handler);
             let config: IrohTransportModConfig =
                 builder.config.get_module_config()?;
+            debug!(
+                relay_url = ?config.iroh_transport.relay_url,
+                max_frame_bytes = config.iroh_transport.max_frame_bytes,
+                connect_timeout_s = config.iroh_transport.connect_timeout_s,
+                "creating IrohTransport with config"
+            );
             let imp =
                 IrohTransport::create(config.iroh_transport, handler.clone())
                     .await?;
+            info!("IrohTransport created successfully");
             Ok(DefaultTransport::create(&handler, imp))
         })
     }
@@ -190,40 +210,59 @@ impl IrohTransport {
         config: IrohTransportConfig,
         handler: Arc<TxImpHnd>,
     ) -> K2Result<DynTxImp> {
+        info!("IrohTransport::create starting");
+        debug!(
+            relay_url = ?config.relay_url,
+            relay_allow_plain_text = config.relay_allow_plain_text,
+            max_frame_bytes = config.max_frame_bytes,
+            connect_timeout_s = config.connect_timeout_s,
+            "iroh transport configuration"
+        );
+
         // If a relay server is configured, only use that.
         // Otherwise, use the default relay servers provided by n0.
         let mut builder = if let Some(relay_url) = &config.relay_url {
+            info!(relay_url = %relay_url, "using custom relay server");
             let relay_url =
                 RelayUrl::from_str(relay_url).map_err(K2Error::other)?;
+            debug!(parsed_relay_url = ?relay_url, "parsed relay URL successfully");
             let relay_map = RelayMap::from_iter([relay_url]);
             Endpoint::empty_builder(RelayMode::Custom(relay_map))
         } else {
+            info!("using default n0 relay servers");
             Endpoint::empty_builder(RelayMode::Default)
         };
         // Set kitsune2 protocol for handling data.
+        debug!(alpn = ?String::from_utf8_lossy(ALPN), "setting ALPN protocol");
         builder = builder.alpns(vec![ALPN.to_vec()]);
 
         // Test relay server uses self-signed certificate, so skip certificate verification.
         #[cfg(feature = "test-utils")]
         {
+            debug!("test-utils feature enabled: skipping relay cert verification");
             builder = builder.insecure_skip_relay_cert_verify(true);
         }
 
+        trace!("binding iroh endpoint...");
         let endpoint = builder.bind().await.map_err(|err| {
+            error!(?err, "failed to bind iroh endpoint");
             K2Error::other_src("failed to bind iroh endpoint", err)
         })?;
+        info!(endpoint_id = ?endpoint.id(), "iroh endpoint bound successfully");
 
         let endpoint = Arc::new(endpoint);
         let local_url = Arc::new(RwLock::new(None));
         let connections = Arc::new(RwLock::new(HashMap::new()));
         let connection_locks = Arc::new(Mutex::new(HashMap::new()));
 
+        debug!("spawning watch_addr_task to monitor address changes");
         let watch_addr_task = Self::spawn_watch_addr_task(
             endpoint.clone(),
             handler.clone(),
             local_url.clone(),
         );
 
+        debug!("spawning accept_task to handle incoming connections");
         let accept_task = Self::spawn_accept_task(
             endpoint.clone(),
             handler.clone(),
@@ -242,6 +281,7 @@ impl IrohTransport {
             accept_task,
             config,
         });
+        info!("IrohTransport::create completed successfully");
         Ok(out)
     }
 
@@ -255,32 +295,57 @@ impl IrohTransport {
         handler: Arc<TxImpHnd>,
         local_url: Arc<RwLock<Option<Url>>>,
     ) -> AbortHandle {
+        info!("watch_addr_task starting");
         let mut watcher = endpoint.watch_addr();
         tokio::spawn(async move {
+            debug!("watch_addr_task: entering main loop");
             loop {
+                trace!("watch_addr_task: waiting for address update...");
                 match watcher.updated().await {
                     Ok(addr) => {
+                        debug!(
+                            relay_count = addr.relay_urls().count(),
+                            endpoint_id = ?addr.id,
+                            "watch_addr_task: received address update"
+                        );
+                        trace!(
+                            relay_urls = ?addr.relay_urls().collect::<Vec<_>>(),
+                            "watch_addr_task: full address details"
+                        );
                         if let Some(url) = get_url_with_first_relay(&addr) {
                             {
-                                info!(?url, "received a new listening address from relay server");
+                                info!(?url, "watch_addr_task: received new listening address from relay server");
                                 let mut guard =
                                     local_url.write().expect("poisoned");
-                                if guard.as_ref() != Some(&url) {
+                                let url_changed = guard.as_ref() != Some(&url);
+                                debug!(
+                                    previous_url = ?guard.as_ref(),
+                                    new_url = ?url,
+                                    url_changed,
+                                    "watch_addr_task: checking URL change"
+                                );
+                                if url_changed {
+                                    info!(old_url = ?guard.as_ref(), new_url = ?url, "watch_addr_task: updating local URL");
                                     *guard = Some(url.clone());
                                 }
                             }
+                            debug!("watch_addr_task: notifying handler of new listening address");
                             handler.new_listening_address(url.clone()).await;
+                            debug!("watch_addr_task: handler notification completed");
+                        } else {
+                            warn!("watch_addr_task: no relay URL found in address update");
                         }
                     }
                     Err(err) => {
                         error!(
                             ?err,
-                            "address watcher update failed, stopping watch loop"
+                            "watch_addr_task: address watcher update failed, stopping watch loop"
                         );
                         break;
                     }
                 }
             }
+            warn!("watch_addr_task: exiting main loop");
         })
         .abort_handle()
     }
@@ -297,49 +362,75 @@ impl IrohTransport {
         local_url: Arc<RwLock<Option<Url>>>,
         max_frame_bytes: usize,
     ) -> AbortHandle {
+        info!("accept_task starting");
         tokio::spawn(async move {
+            debug!("accept_task: entering main loop");
             loop {
+                trace!("accept_task: waiting for incoming connection...");
                 match endpoint.accept().await {
-                    Some(incoming) => match incoming.await {
-                        Ok(conn) => {
-                            info!(remote_id = ?conn.remote_id(),"receiving incoming connection");
-                            let conn_opened_at_s = SystemTime::UNIX_EPOCH
-                                .elapsed()
-                                .unwrap_or_else(|err| {
-                                    warn!(?err, "failed to get system time");
-                                    Duration::from_secs(0)
-                                })
-                                .as_secs();
-                            let conn = Arc::new(conn);
+                    Some(incoming) => {
+                        debug!(
+                            "accept_task: received incoming connection request"
+                        );
+                        trace!("accept_task: awaiting connection handshake...");
+                        match incoming.await {
+                            Ok(conn) => {
+                                info!(
+                                    remote_id = ?conn.remote_id(),
+                                    "accept_task: incoming connection established successfully"
+                                );
+                                debug!(
+                                    remote_id = ?conn.remote_id(),
+                                    stable_id = conn.stable_id(),
+                                    "accept_task: connection details"
+                                );
+                                let conn_opened_at_s = SystemTime::UNIX_EPOCH
+                                    .elapsed()
+                                    .unwrap_or_else(|err| {
+                                        warn!(?err, "accept_task: failed to get system time");
+                                        Duration::from_secs(0)
+                                    })
+                                    .as_secs();
+                                let conn = Arc::new(conn);
 
-                            // Create a new connection context.
-                            let conn_type_watcher =
-                                endpoint.conn_type(conn.remote_id());
-                            ConnectionContext::new(
-                                ConnectionContextParams{
-                                handler: handler.clone(),
-                                connection: conn,
-                                remote_url: None,
-                                preflight_sent: false,
-                                opened_at_s: conn_opened_at_s,
-                                connection_type_watcher: conn_type_watcher,
-                                connections: connections.clone(),
-                                local_url: local_url.clone(),
-                                max_frame_bytes,
-                        });
+                                // Create a new connection context.
+                                debug!(
+                                    remote_id = ?conn.remote_id(),
+                                    "accept_task: creating ConnectionContext for incoming connection"
+                                );
+                                let conn_type_watcher =
+                                    endpoint.conn_type(conn.remote_id());
+                                ConnectionContext::new(
+                                    ConnectionContextParams{
+                                    handler: handler.clone(),
+                                    connection: conn.clone(),
+                                    remote_url: None,
+                                    preflight_sent: false,
+                                    opened_at_s: conn_opened_at_s,
+                                    connection_type_watcher: conn_type_watcher,
+                                    connections: connections.clone(),
+                                    local_url: local_url.clone(),
+                                    max_frame_bytes,
+                                });
+                                debug!(
+                                    remote_id = ?conn.remote_id(),
+                                    "accept_task: ConnectionContext created for incoming connection"
+                                );
+                            }
+                            Err(err) => {
+                                error!(?err, "accept_task: iroh incoming connection handshake failed");
+                            }
                         }
-                        Err(err) => {
-                            error!(?err, "iroh incoming connection failed");
-                        }
-                    },
+                    }
                     None => {
                         error!(
-                            "iroh incoming connection failed - endpoint closed"
+                            "accept_task: iroh incoming connection failed - endpoint closed"
                         );
                         break;
                     }
                 }
             }
+            warn!("accept_task: exiting main loop");
         })
         .abort_handle()
     }
@@ -358,18 +449,43 @@ impl IrohTransport {
         local_url: Arc<RwLock<Option<Url>>>,
         config: &IrohTransportConfig,
     ) -> K2Result<Arc<ConnectionContext>> {
+        info!(
+            remote_url = ?remote_url,
+            target_id = ?target.id,
+            timeout_s = config.connect_timeout_s,
+            "create_connection_and_context: starting connection to peer"
+        );
+        debug!(
+            target = ?target,
+            "create_connection_and_context: full target address details"
+        );
+
         // Establish connection
+        trace!("create_connection_and_context: initiating connection with timeout...");
         let conn = tokio::time::timeout(
             Duration::from_secs(config.connect_timeout_s as u64),
             endpoint.connect(target.clone(), ALPN),
         )
         .await
-        .map_err(|err| K2Error::other_src("iroh connect timed out", err))?
-        .map_err(|err| K2Error::other_src("iroh connect failed", err))?;
+        .map_err(|err| {
+            error!(?err, ?remote_url, timeout_s = config.connect_timeout_s, "create_connection_and_context: connection timed out");
+            K2Error::other_src("iroh connect timed out", err)
+        })?
+        .map_err(|err| {
+            error!(?err, ?remote_url, "create_connection_and_context: connection failed");
+            K2Error::other_src("iroh connect failed", err)
+        })?;
+        info!(
+            remote_id = ?conn.remote_id(),
+            remote_url = ?remote_url,
+            stable_id = conn.stable_id(),
+            "create_connection_and_context: connection established successfully"
+        );
+
         let conn_opened_at_s = SystemTime::UNIX_EPOCH
             .elapsed()
             .unwrap_or_else(|err| {
-                warn!(?err, "failed to get system time");
+                warn!(?err, "create_connection_and_context: failed to get system time");
                 Duration::from_secs(0)
             })
             .as_secs();
@@ -377,11 +493,26 @@ impl IrohTransport {
 
         // Send preflight as first message on the new connection.
         let maybe_local_url = local_url.read().expect("poisoned").clone();
+        debug!(
+            local_url = ?maybe_local_url,
+            "create_connection_and_context: checking local URL availability"
+        );
+
         if let Some(current_local_url) = maybe_local_url {
+            debug!(
+                local_url = ?current_local_url,
+                remote_url = ?remote_url,
+                "create_connection_and_context: requesting preflight bytes from handler"
+            );
             let preflight_bytes =
                 handler.peer_connect(remote_url.clone()).await?;
+            debug!(
+                preflight_bytes_len = preflight_bytes.len(),
+                "create_connection_and_context: received preflight bytes from handler"
+            );
 
             let conn_type_watcher = endpoint.conn_type(target.id);
+            debug!("create_connection_and_context: creating ConnectionContext");
             let ctx = ConnectionContext::new(ConnectionContextParams {
                 handler: handler.clone(),
                 connection: conn.clone(),
@@ -393,15 +524,26 @@ impl IrohTransport {
                 local_url: local_url.clone(),
                 max_frame_bytes: config.max_frame_bytes,
             });
+            debug!("create_connection_and_context: ConnectionContext created");
 
+            trace!(
+                local_url = ?current_local_url,
+                remote_url = ?remote_url,
+                "create_connection_and_context: sending preflight frame"
+            );
             ctx.send_preflight_frame(
                 current_local_url.clone(),
                 preflight_bytes,
             )
             .await?;
+            info!(
+                remote_url = ?remote_url,
+                "create_connection_and_context: preflight frame sent successfully"
+            );
 
             Ok(ctx)
         } else {
+            error!("create_connection_and_context: connection attempted before home relay URL is known");
             Err(K2Error::other(
                 "Connection attempted before home relay URL is known",
             ))
@@ -411,7 +553,9 @@ impl IrohTransport {
 
 impl TxImp for IrohTransport {
     fn url(&self) -> Option<Url> {
-        self.local_url.read().expect("poisoned").clone()
+        let url = self.local_url.read().expect("poisoned").clone();
+        trace!(url = ?url, "TxImp::url called");
+        url
     }
 
     fn disconnect(
@@ -419,15 +563,31 @@ impl TxImp for IrohTransport {
         peer: Url,
         _payload: Option<(String, Bytes)>,
     ) -> BoxFut<'_, ()> {
+        info!(peer = ?peer, "TxImp::disconnect called");
         if let Some(ctx) =
             self.connections.write().expect("poisoned").remove(&peer)
         {
+            debug!(peer = ?peer, "TxImp::disconnect: found connection, disconnecting");
             ctx.disconnect("disconnecting from remote".to_string());
+        } else {
+            debug!(peer = ?peer, "TxImp::disconnect: no active connection found");
         }
         Box::pin(async {})
     }
 
     fn send(&self, remote_url: Url, data: Bytes) -> BoxFut<'_, K2Result<()>> {
+        let data_len = data.len();
+        debug!(
+            remote_url = ?remote_url,
+            data_len,
+            "TxImp::send called"
+        );
+        trace!(
+            remote_peer_id = ?remote_url.peer_id(),
+            remote_addr = ?remote_url.addr(),
+            "TxImp::send: destination details"
+        );
+
         let local_url = self.local_url.clone();
         let endpoint = self.endpoint.clone();
         let handler = self.handler.clone();
@@ -435,9 +595,15 @@ impl TxImp for IrohTransport {
         let connection_locks = self.connection_locks.clone();
 
         Box::pin(async move {
+            trace!("TxImp::send: parsing remote URL to endpoint address");
             let remote = endpoint_from_url(&remote_url)?;
+            debug!(
+                remote_endpoint = ?remote,
+                "TxImp::send: parsed endpoint address"
+            );
 
             // Get or create the connection lock for this peer to serialize connection creation.
+            trace!("TxImp::send: acquiring peer connection lock");
             let peer_lock = {
                 let mut locks = connection_locks.lock().expect("poisoned");
                 locks
@@ -458,7 +624,9 @@ impl TxImp for IrohTransport {
             // complexity in this method, but would increase complexity in all places
             // where the connection map is used. The connecions_locks map is only
             // used in this method. Overall it is simpler as is.
+            trace!("TxImp::send: waiting to acquire peer lock...");
             let _lock_guard = peer_lock.lock().await;
+            trace!("TxImp::send: peer lock acquired");
 
             // Atomically check and create connection and context if needed.
             let connection_context = {
@@ -471,12 +639,20 @@ impl TxImp for IrohTransport {
                     .cloned();
                 if let Some(ctx) = existing {
                     // Connection already exists, use it (preflight already done).
+                    debug!(
+                        remote_url = ?remote_url,
+                        "TxImp::send: using existing connection"
+                    );
                     drop(_lock_guard);
                     ctx
                 } else {
                     // Connection doesn't exist, create it.
                     // This establishes the connection and sends the preflight to the remote.
-                    info!(remote = ?remote_url.peer_id(), "establishing connection to remote");
+                    info!(
+                        remote = ?remote_url.peer_id(),
+                        remote_url = ?remote_url,
+                        "TxImp::send: no existing connection, establishing new connection"
+                    );
                     let ctx = Self::create_connection_and_context(
                         endpoint,
                         remote,
@@ -487,13 +663,18 @@ impl TxImp for IrohTransport {
                         &self.config,
                     )
                     .await?;
+                    info!(
+                        remote_url = ?remote_url,
+                        "TxImp::send: new connection established successfully"
+                    );
 
                     // Now that preflight has been sent successfully, add context to
                     // connections map.
+                    debug!("TxImp::send: adding connection to connections map");
                     connections
                         .write()
                         .expect("poisoned")
-                        .insert(remote_url, ctx.clone());
+                        .insert(remote_url.clone(), ctx.clone());
 
                     // Lock is released after connection is established and preflight is done.
                     ctx
@@ -501,7 +682,17 @@ impl TxImp for IrohTransport {
             };
 
             // Send actual message.
+            trace!(
+                remote_url = ?remote_url,
+                data_len,
+                "TxImp::send: sending data frame"
+            );
             connection_context.send_data_frame(data).await?;
+            debug!(
+                remote_url = ?remote_url,
+                data_len,
+                "TxImp::send: data frame sent successfully"
+            );
 
             Ok(())
         })
@@ -509,17 +700,24 @@ impl TxImp for IrohTransport {
 
     fn get_connected_peers(&self) -> BoxFut<'_, K2Result<Vec<Url>>> {
         Box::pin(async {
-            Ok(self
+            let peers: Vec<Url> = self
                 .connections
                 .read()
                 .expect("poisoned")
                 .keys()
                 .cloned()
-                .collect())
+                .collect();
+            debug!(
+                peer_count = peers.len(),
+                peers = ?peers,
+                "TxImp::get_connected_peers called"
+            );
+            Ok(peers)
         })
     }
 
     fn dump_network_stats(&self) -> BoxFut<'_, K2Result<TransportStats>> {
+        trace!("TxImp::dump_network_stats called");
         Box::pin(async move {
             let connections =
                 self.connections.read().expect("poisoned").clone();
@@ -529,7 +727,7 @@ impl TxImp for IrohTransport {
             {
                 peer_urls.push(own_url);
             }
-            let stat_connections = connections
+            let stat_connections: Vec<TransportConnectionStats> = connections
                 .into_values()
                 .map(|context| {
                     TransportConnectionStats {
@@ -553,6 +751,11 @@ impl TxImp for IrohTransport {
                     }
                 })
                 .collect();
+            debug!(
+                connection_count = stat_connections.len(),
+                peer_url_count = peer_urls.len(),
+                "TxImp::dump_network_stats returning stats"
+            );
             Ok(TransportStats {
                 backend: "iroh".to_string(),
                 peer_urls,
