@@ -160,6 +160,12 @@ impl CoreBootstrap {
         peer_store: DynPeerStore,
         space: SpaceId,
     ) -> Self {
+        tracing::info!(
+            ?space,
+            server_url = ?config.server_url,
+            "CoreBootstrap::new - creating bootstrap instance"
+        );
+
         let auth_material =
             Arc::new(builder.auth_material.as_ref().map(|auth_material| {
                 kitsune2_bootstrap_client::AuthMaterial::new(
@@ -169,6 +175,7 @@ impl CoreBootstrap {
 
         let (push_send, push_recv) = tokio::sync::mpsc::channel(1024);
 
+        tracing::debug!("CoreBootstrap::new - spawning push_task");
         let push_task = tokio::task::spawn(push_task(
             config.clone(),
             push_send.clone(),
@@ -176,6 +183,7 @@ impl CoreBootstrap {
             auth_material.clone(),
         ));
 
+        tracing::debug!("CoreBootstrap::new - spawning poll_task");
         let poll_task = tokio::task::spawn(poll_task(
             builder,
             config,
@@ -183,6 +191,8 @@ impl CoreBootstrap {
             peer_store,
             auth_material,
         ));
+
+        tracing::info!("CoreBootstrap::new - bootstrap instance created successfully");
 
         Self {
             space,
@@ -217,6 +227,11 @@ async fn push_task(
     mut push_recv: PushRecv,
     auth_material: Arc<Option<kitsune2_bootstrap_client::AuthMaterial>>,
 ) {
+    tracing::info!(
+        server_url = ?config.server_url,
+        "push_task: starting, waiting for agent info to publish"
+    );
+
     // Already checked to be a valid URL by the config validation.
     let server_url = url::Url::parse(
         config
@@ -227,7 +242,17 @@ async fn push_task(
     .expect("invalid server url");
     let mut wait = None;
 
+    tracing::debug!(
+        server_url = %server_url,
+        "push_task: parsed server URL, entering main loop"
+    );
+
     while let Some(info) = push_recv.recv().await {
+        tracing::debug!(
+            space = ?info.space,
+            agent = ?info.agent,
+            "push_task: received agent info to publish"
+        );
         match tokio::task::spawn_blocking({
             let auth_material = auth_material.clone();
             let server_url = server_url.clone();
@@ -288,6 +313,12 @@ async fn poll_task(
     peer_store: DynPeerStore,
     auth_material: Arc<Option<kitsune2_bootstrap_client::AuthMaterial>>,
 ) {
+    tracing::info!(
+        server_url = ?config.server_url,
+        space = ?space_id,
+        "poll_task: starting"
+    );
+
     // Already checked to be a valid URL by the config validation.
     let server_url = url::Url::parse(
         config
@@ -299,7 +330,14 @@ async fn poll_task(
 
     let mut wait = config.backoff_min();
 
+    tracing::debug!(
+        server_url = %server_url,
+        initial_wait_ms = wait.as_millis(),
+        "poll_task: parsed server URL, entering poll loop"
+    );
+
     loop {
+        tracing::trace!("poll_task: fetching peers from bootstrap server");
         match tokio::task::spawn_blocking({
             let auth_material = auth_material.clone();
             let server_url = server_url.clone();
@@ -318,9 +356,13 @@ async fn poll_task(
         .map_err(|_| K2Error::other("task join error"))
         {
             Err(err) | Ok(Err(err)) => {
-                tracing::debug!(?err, "failure contacting bootstrap server");
+                tracing::warn!(?err, "poll_task: failure contacting bootstrap server, will retry");
             }
             Ok(Ok(list)) => {
+                tracing::info!(
+                    peer_count = list.len(),
+                    "poll_task: successfully fetched peers from bootstrap server"
+                );
                 let _ = peer_store.insert(list).await;
             }
         }
@@ -330,6 +372,7 @@ async fn poll_task(
             wait = config.backoff_max();
         }
 
+        tracing::trace!(wait_ms = wait.as_millis(), "poll_task: sleeping before next poll");
         tokio::time::sleep(wait).await;
     }
 }

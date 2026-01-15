@@ -51,12 +51,17 @@ impl AuthMaterial {
         if matches!(auth_type, AuthType::IfUninit)
             && self.auth_token.lock().unwrap().is_some()
         {
+            tracing::trace!("bootstrap client: using cached auth token");
             return Ok(());
         }
 
+        tracing::debug!(auth_url = %auth_url, "bootstrap client: authenticating with server");
         let token = ureq::put(auth_url)
             .send(&self.auth_material[..])
-            .map_err(|err| K2Error::other_src("Authenticate Failed", err))?
+            .map_err(|err| {
+                tracing::error!(?err, "bootstrap client: authentication failed");
+                K2Error::other_src("Authenticate Failed", err)
+            })?
             .into_body()
             .read_to_string()
             .map_err(|err| K2Error::other_src("Authenticate Failed", err))?;
@@ -71,6 +76,7 @@ impl AuthMaterial {
             .map_err(|err| K2Error::other_src("Authenticate Failed", err))?;
 
         *self.auth_token.lock().unwrap() = Some(auth_token.auth_token);
+        tracing::debug!("bootstrap client: authentication successful");
 
         Ok(())
     }
@@ -139,6 +145,13 @@ pub fn blocking_put_auth(
     agent_info: &AgentInfoSigned,
     auth_material: Option<&AuthMaterial>,
 ) -> K2Result<()> {
+    tracing::debug!(
+        server_url = %server_url,
+        space = ?agent_info.space,
+        agent = ?agent_info.agent,
+        "bootstrap client: PUT agent info to server"
+    );
+
     server_url.set_path("authenticate");
     let auth_url = server_url.as_str().to_string();
 
@@ -148,6 +161,7 @@ pub fn blocking_put_auth(
         base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(&**agent_info.agent),
     ));
     let put_url = server_url.as_str().to_string();
+    tracing::trace!(put_url = %put_url, "bootstrap client: PUT URL constructed");
 
     if let Some(auth_material) = &auth_material {
         auth_material.priv_authenticate(&auth_url, AuthType::IfUninit)?;
@@ -160,6 +174,7 @@ pub fn blocking_put_auth(
         encoded: &str,
         auth_material: &Option<&AuthMaterial>,
     ) -> Res<()> {
+        tracing::trace!("bootstrap client: sending PUT request");
         let mut req = ureq::put(put_url);
 
         if let Some(auth_material) = auth_material {
@@ -175,8 +190,25 @@ pub fn blocking_put_auth(
 
     if let Some(auth_material) = auth_material {
         if res.needs_auth() {
+            tracing::debug!("bootstrap client: PUT received 401, re-authenticating");
             auth_material.priv_authenticate(&auth_url, AuthType::Force)?;
             res = priv_put(&put_url, &encoded, &Some(auth_material));
+        }
+    }
+
+    match &res {
+        Res::Ok(_) => {
+            tracing::info!(
+                space = ?agent_info.space,
+                agent = ?agent_info.agent,
+                "bootstrap client: PUT successful"
+            );
+        }
+        Res::Err(err) => {
+            tracing::warn!(?err, "bootstrap client: PUT failed");
+        }
+        Res::Auth => {
+            tracing::warn!("bootstrap client: PUT failed - unauthorized");
         }
     }
 
@@ -207,6 +239,12 @@ pub fn blocking_get_auth(
     verifier: DynVerifier,
     mut auth_material: Option<&AuthMaterial>,
 ) -> K2Result<Vec<Arc<AgentInfoSigned>>> {
+    tracing::debug!(
+        server_url = %server_url,
+        space = ?space_id,
+        "bootstrap client: GET peers from server"
+    );
+
     server_url.set_path("authenticate");
     let auth_url = server_url.as_str().to_string();
 
@@ -219,11 +257,13 @@ pub fn blocking_get_auth(
         base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(&**space_id)
     ));
     let get_url = server_url.as_str().to_string();
+    tracing::trace!(get_url = %get_url, "bootstrap client: GET URL constructed");
 
     fn priv_get(
         get_url: &str,
         auth_material: &Option<&AuthMaterial>,
     ) -> Res<String> {
+        tracing::trace!("bootstrap client: sending GET request");
         let mut req = ureq::get(get_url);
 
         if let Some(auth_material) = auth_material {
@@ -242,20 +282,29 @@ pub fn blocking_get_auth(
 
     if let Some(auth_material) = auth_material {
         if res.needs_auth() {
+            tracing::debug!("bootstrap client: GET received 401, re-authenticating");
             auth_material.priv_authenticate(&auth_url, AuthType::Force)?;
             res = priv_get(&get_url, &Some(auth_material));
         }
     }
 
-    let res = K2Result::from(res)?;
+    let res_str = K2Result::from(res)?;
 
-    Ok(AgentInfoSigned::decode_list(&verifier, res.as_bytes())?
+    let peer_list = AgentInfoSigned::decode_list(&verifier, res_str.as_bytes())?
         .into_iter()
         .filter_map(|l| {
             l.inspect_err(|err| {
-                tracing::debug!(?err, "failure decoding bootstrap agent info");
+                tracing::debug!(?err, "bootstrap client: failure decoding agent info");
             })
             .ok()
         })
-        .collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+
+    tracing::info!(
+        space = ?space_id,
+        peer_count = peer_list.len(),
+        "bootstrap client: GET successful, received peers"
+    );
+
+    Ok(peer_list)
 }
